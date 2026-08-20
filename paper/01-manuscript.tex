@@ -1,0 +1,777 @@
+% =====================================================================
+%  A Fused Descriptor Matcher for COLMAP  ::  IEEE conference format
+%
+%  BUILD:  pdflatex serac_ieee
+%          bibtex   serac_ieee
+%          pdflatex serac_ieee   (x2)
+%  Requires refs.bib in the same directory.
+%
+%  SCOPE NOTE: this revision is scoped to SIFT DESCRIPTOR MATCHING only.
+%  No extraction edit was applied (144.0 s -> 143.7 s), so extraction is
+%  reported as an unchanged control, not as a contribution.
+%
+%  MEASURED:     stage timings (n=10), reconstruction quality (n=1 each),
+%                SASS instruction counts.
+%  NOT MEASURED: per-stratum fidelity, run-to-run mapper calibration,
+%                tuned-COLMAP and hand-written-kernel baselines. Future work.
+%
+%  House style: no em dashes or en dashes anywhere in the prose.
+% =====================================================================
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{url}
+
+% bold run-in heading (IEEEtran numbers \paragraph, which we don't want here)
+\newcommand{\para}[1]{\smallskip\noindent\textbf{#1}\ }
+
+\newcommand{\sys}{\textnormal{\textsc{Serac}}\xspace}
+\newcommand{\opt}[1]{\texttt{#1}}
+
+\begin{document}
+
+\title{A Fused Descriptor Matcher for COLMAP:\\
+Stage Speedup Without\\
+End-to-End Gain}
+
+\author{SiCheng Zhao\textsuperscript{1,2}, Arjun Pakrashi\textsuperscript{3,4}, Soumyabrata Dev\textsuperscript{1,2,3} \vspace{0.5em}\\ \textsuperscript{1}The ADAPT Research Centre, Dublin, Ireland\\
+\textsuperscript{2}School of Computer Science and Statistics, Trinity College Dublin, Ireland\\
+\textsuperscript{3}School of Computer Science, University College Dublin, Ireland\\
+\textsuperscript{4}Beijing-Dublin International College, Beijing, China\\
+zhaos2@tcd.ie, arjun.pakrashi@ucd.ie, devs@tcd.ie}
+
+\maketitle
+
+\begin{abstract}
+COLMAP's GPU matcher builds a full similarity matrix for every image pair, then
+discards almost all of it: only the best and second best score in each row are
+used. We remove the matrix. The kernel keeps the top two scores in registers as
+it goes, so it writes two numbers per row instead of one for every candidate,
+and the change is exact: the match lists it returns are byte for byte identical
+to the baseline's. Peak matcher memory falls from $1546$ to $700$\,MiB, lifting
+the limit COLMAP's own documentation warns about and the feature clamping that
+limit forces on large images. The edit was found by \sys, an agentic search
+loop that cannot modify its own test harness.
+
+On a 589 image UAV survey matched over all $173{,}166$ pairs, matching is
+$1.28\times$ faster ($95\%$ CI $[1.26, 1.31]$, $n = 10$, $p < 10^{-15}$) and the
+reconstruction is unchanged: $585$ of $589$ images register in both, no
+statistic except GPS accuracy moves by even a tenth of a percent, and a rerun
+of the unmodified baseline moves them as much. The speedup costs nothing.
+
+It also does not reach the user. Matching is only $12.1\%$ of total runtime, so
+even our $1.28\times$ can shorten the whole pipeline by at most $1.03\times$,
+and the $91$\,s saved is a third of one standard deviation of the mapping
+stage, which we never touched. We
+report this second result as carefully as the first, because a kernel speedup
+without such an accounting says nothing about whether anyone's job finishes
+sooner. Code is available at
+\url{https://github.com/AppleJack9050/SERAC}.
+\end{abstract}
+
+\begin{IEEEkeywords}
+GPU kernel optimization, CUDA, structure from motion, COLMAP, descriptor
+matching, kernel fusion, benchmark validity
+\end{IEEEkeywords}
+
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+% =====================================================================
+
+COLMAP \cite{schoenberger2016sfm} is the reference implementation for
+incremental structure from motion, and two of its four pipeline stages run on
+the GPU. This paper is about one of them.
+
+COLMAP's descriptor matcher computes pairwise similarity by materializing a
+dense matrix in 4-byte elements. The documentation \cite{schoenberger2016sfm,
+schoenberger2016mvs} gives the requirement as roughly $4M^2 + 1024M$ bytes for
+$M$ features per image and advises reducing the match cap when memory is short,
+warning that this degrades results because lower scale features are clamped
+away. A memory constraint of this shape is a quality constraint, since the
+remedy for running out of memory is to discard features. It binds at large
+feature counts and on small cards. It did not bind in the experiments reported
+here, where measured peak matcher memory was $1546$\,MiB against $32.6$\,GB
+available, so the quality half of the argument is architectural; the memory
+half is measured, at $1546$ versus $700$\,MiB (\S\ref{sec:results}).
+
+The constraint is avoidable, and the reason is visible in what the stage
+actually consumes. The matcher writes $MN$ similarities to global memory and
+then reads all of them back in order to retain two per row, the best and the
+second best, for Lowe's ratio test. Everything else is discarded. Tiling the
+product and maintaining the running top two in registers across tiles delivers
+the same output while writing two similarities and two indices per row instead
+of $N$, so the $M \times N$ intermediate is never materialized, and both the
+memory ceiling and the clamping disappear with it. The transformation does not
+trade correctness for speed: the quantity reduced is the one the baseline
+already reduces, and the two implementations differ only in the order of
+accumulation.
+
+We built an agentic search loop, \sys{} (SIFT Efficient Reduction and
+Accelerated Correspondence), to find and validate this class of edit, and we
+report what happened when it did. Two results follow, and they point in
+opposite directions.
+
+\para{The stage result is positive.} The fused matcher is $1.28\times$ faster
+with a tight confidence interval over $n = 10$ runs, its output is byte for
+byte identical to the baseline's, and reconstruction statistics move by no more
+than a same-binary rerun of the baseline moves them on its own. Nothing was
+given up to obtain the speedup.
+
+\para{The end-to-end result is negative.} In the configuration measured,
+matching is $12.1\%$ of wall clock and mapping is $83.6\%$. Even an infinitely
+fast matcher yields at most $1.14\times$; at the measured stage speedup the
+predicted gain is $1.03\times$; and the $91$\,s saved is well under half the
+smallest end-to-end change this experiment can resolve, because the mapping
+stage we did not modify varies by $288$\,s between runs. The gain is therefore
+not merely diluted, it is below the resolution of the measurement. This is the
+sharper form of a hazard that the agentic kernel optimization literature does
+not have to confront, because in that literature the optimized kernel is by
+construction the whole workload.
+
+\para{Contributions.}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=2pt]
+\item \textbf{A fused matcher} for COLMAP (\S\ref{sec:matcher}) that holds the
+per-row top two in registers across tiles, removing the $M \times N$
+intermediate, the associated memory ceiling, and the low-scale clamping, while
+returning byte-identical matches.
+\item \textbf{\sys} (\S\ref{sec:harness}), an agentic search loop whose
+verification boundary is unreachable by mechanism rather than forbidden by
+instruction, with confirmation carried down to the instruction mix of the
+shipped binary.
+\item \textbf{A measured evaluation} (\S\ref{sec:results}): $1.28\times$ at the
+stage, quality unchanged, and an accounting of runtime share showing that the
+gain does not reach end-to-end runtime in this configuration and falls below
+what that configuration can resolve.
+\item \textbf{A stated hazard} (\S\ref{sec:trap}) for evaluating this class of
+optimization on scientific imagery, which shaped the harness design and which we
+have not yet measured.
+\end{enumerate}
+
+The matcher is specific to brute force matching that materializes a similarity
+matrix. The harness, the runtime-share argument, and the hazard of
+\S\ref{sec:trap} are not (\S\ref{sec:limitations}).
+
+
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+% =====================================================================
+
+\para{Agentic GPU kernel optimization.} KernelBench
+\cite{ouyang2025kernelbench} established the task formulation; later systems add
+coder and judge decomposition with hardware feedback \cite{zhang2025cudaforge,
+wei2025astra} and reinforcement learned policies \cite{dai2026cuda}. Astra
+\cite{wei2025astra} is closest to our setting, optimizing existing production
+CUDA rather than generating kernels from PyTorch. Two assumptions in that
+literature do not transfer to sparse reconstruction. The correctness oracle is a
+millisecond tensor comparison, whereas here the front end emits a set guarded by
+thresholds and the stages below it are randomized, chaotic, and defined only up
+to a similarity transform (\S\ref{sec:correctness}). And the optimized kernel is
+the workload, whereas here it is a minority of runtime (\S\ref{sec:endtoend}).
+
+That the second assumption matters is not hypothetical. Initial reports of
+$10\times$ to $100\times$ speedups from one agentic CUDA system were
+subsequently attributed to harness exploitation \cite{lange2025towards}, and
+re-evaluating KernelBench under a hardened protocol with a TF32 baseline and
+hidden test distributions moved the best frontier model from $1.43\times$ to
+$0.88\times$ \cite{zhang2026kernelbench}.
+
+\para{Structure from motion.} COLMAP's incremental pipeline
+\cite{schoenberger2016sfm} remains the reference implementation, with GLOMAP
+\cite{pan2024global} a first class global alternative at roughly a third the
+mapping cost \cite{yu2025cusfm}; COLMAP's GPU extractor derives from SiftGPU
+\cite{heymann2007sift}. Algorithmic work on large-scale UAV matching reduces the
+number of candidate image pairs, whereas this work reduces the cost of each
+pair. The two are complementary, and \S\ref{sec:results} indicates that in the
+regime measured here the former is the more effective lever.
+
+\para{Glaciological photogrammetry.} UAV-based SfM is well established for
+glacier monitoring \cite{westoby2012structure, chudley2019high, benoit2019high}.
+The relevant detail for \S\ref{sec:trap} is that validation is conventionally
+performed on stable off-glacier terrain, because on-ice control advects with the
+ice \cite{chudley2019high}.
+
+
+% =====================================================================
+\section{The Matcher}
+\label{sec:matcher}
+% =====================================================================
+
+\subsection{What the baseline does and why it is expensive}
+
+For a pair of images with $M$ and $N$ features, the baseline computes the full
+$M \times N$ similarity matrix in 4-byte elements, writes it to global memory,
+and then reduces each row to its best and second best entry for the ratio test.
+The intermediate is written once and read once, and it is the only reason the
+pair has a memory footprint that grows quadratically in the feature count.
+
+\subsection{The fused form}
+
+The similarity product admits a direct implementation in which it is tiled and
+the per-row top two is maintained in registers across tiles, so that the epilogue
+writes two similarities and two indices per row and the $M \times N$ matrix is
+never materialized. The roughly $8MN$ bytes of write and read-back traffic for
+the intermediate fall to a constant multiple of $M$. Two further changes ride
+along: the 128-term descriptor inner product, previously evaluated as $128$
+scalar \opt{\_\_mul24} calls that have lowered to an emulation sequence on
+every architecture since Fermi, is folded into $32$ packed integer dot product
+(DP4A) instructions, and blocks match $16$ descriptor rows instead of $8$,
+halving descriptor re-reads. Table~\ref{tab:kernels} apportions the gain among
+the three. Two properties follow.
+
+\para{The memory ceiling disappears.} COLMAP's documented $4M^2 + 1024M$
+requirement is dominated by the intermediate, which no longer exists. The advice
+to reduce the match cap under memory pressure, and the low-scale feature
+clamping that advice causes, no longer apply. Per-pair footprint becomes linear
+rather than quadratic in the feature count.
+
+\para{The rewrite is exact, and verifiably so.} The packed dot product on
+descriptor bytes accumulates in $32$ bits and cannot overflow at $128$
+dimensions, so it is arithmetically identical to the scalar sequence it
+replaces, and the fused reduction reproduces the original scan's zero floor and
+tie handling. This is not argued but checked: a SHA-256 hash over all
+$173{,}166$ per-pair correspondence blobs ($213$\,MB, $26{,}623{,}083$
+correspondences) is identical between the two builds. One documented corner
+remains: on an exact top-one tie the two builds prefer different tied columns,
+which cannot change a reported match at any ratio threshold up to $1$, because
+a tie forces the ratio test to reject the row in both builds. Byte-identical
+output is why \S\ref{sec:quality} expects reconstruction statistics to move
+only by the mapper's own run-to-run noise, and why it can use a baseline rerun
+as the control.
+
+\subsection{Why correctness here is not a tensor comparison}
+\label{sec:correctness}
+
+The verification problem in this pipeline has three distinct layers, and no
+single predicate covers them.
+
+Matching as implemented here is deterministic, so an exact comparison exists;
+GPU extraction, by contrast, is not run-to-run deterministic in COLMAP, which
+same-binary control runs confirm. Front-end output is in either case a
+\emph{set} guarded by thresholds. In extraction, a
+reassociation that shifts a difference of Gaussians extremum by $10^{-7}$ flips
+any keypoint lying within $10^{-7}$ of the peak threshold. In matching, the
+stage modified here, the same structure appears one level up: a similarity
+change at the last digit flips any pair whose ratio of best to second best
+distance sits at the acceptance threshold, so the match set is exactly as
+cliffed as the keypoint set, and the near-tie analysis of \S\ref{sec:matcher}
+identifies which pairs can flip. The harness therefore compares front-end sets
+by correspondence (within $0.5$\,px in position and $0.02$ in
+$\lvert\log(\sigma/\sigma')\rvert$ for keypoints, by index for matches) and
+scores agreement against the population that may legitimately flip. These are
+the criteria candidates were gated on during the search; they are not among the
+quantities we report in \S\ref{sec:results}.
+
+Geometric verification below it is randomized, so comparisons there require a
+pinned RANSAC seed, and we compare inlier counts and two-view model type
+agreement.
+
+Incremental mapping is chaotic in its input, since one flipped match can change
+the seed pair and cascade into a globally different but equally valid model, and
+its output is defined only up to a similarity transform, so any pose comparison
+must follow Sim(3) alignment \cite{umeyama1991least}. Comparing unaligned poses
+is meaningless. Because the mapper is also not run-to-run deterministic, a
+candidate can only be judged against the pipeline's own variation, which means
+repeating the unmodified pipeline over seeds and thread counts and asking whether
+the candidate's effect falls inside that spread. We specify this comparison but
+did not run it, and \S\ref{sec:notestablished} states what that costs the
+conclusions.
+
+
+% =====================================================================
+\section{The \sys{} Harness}
+\label{sec:harness}
+% =====================================================================
+
+\sys{} is a search and verification loop, not a model. Each round profiles the
+incumbent, draws $B_1 = 256$ hypotheses across at least four families, applies
+one minimal diff per hypothesis, and admits a candidate only if it clears, in
+order, a static gate, the build, a fast fidelity check ($\sim$3\,s), and a
+slower one ($\sim$15\,s). Survivors are ranked on verified correspondences, the
+best eight go to a critic, and the Pareto front is promoted nightly to
+reconstruction-level evaluation on held-out images.
+
+Two design choices matter more than the loop structure. Each hypothesis must
+carry a stated mechanism and a \emph{falsifiable numeric prediction}, which is
+what separates hardware reasoning from optimization folklore, and diffs are kept
+minimal because attribution is otherwise impossible. The critic is not asked
+whether a candidate is correct, since a model presented with an open-ended
+correctness question tends toward affirmation. It is asked to construct the
+strongest available argument that the measured speedup is artifactual, working
+through a list of known failure modes fixed in advance: precision reductions
+that pass global fidelity checks, option changes that simply do less work,
+fallbacks to the CPU or OpenGL path in which the kernel never runs, and timing
+that omits synchronization. The diagnostic value lies in enumerating these
+before the search begins, not in the model.
+
+\subsection{The verification boundary is mechanical}
+\label{sec:boundary}
+
+Harness, metrics, golden references, option defaults, seed derivation, and
+numerics-affecting build flags are unreachable rather than forbidden. Four
+layers enforce this. The harness repository is read-only. A non-LLM static gate
+rejects any diff that touches it. The driver hashes the \emph{effective} options
+at runtime and refuses to score a mismatch, which catches indirect tampering
+that diff inspection misses. And an execution path assertion confirms that the
+CUDA path ran, rather than the OpenGL or CPU fallback COLMAP selects when
+\opt{estimate\_affine\_shape} is enabled; absent that layer, a candidate can
+appear to accelerate a kernel by preventing its execution.
+
+The runtime hash matters because the exploits of consequence are not edits to a
+default value, which a diff would reveal, but changes that cause a different
+value to be reached.
+
+One hazard on that list is a benchmarking artifact rather than an agent
+behaviour, and is worth stating separately: COLMAP omits pairs that already
+possess a two-view geometry \cite{schoenberger2016sfm}, so every timed run must
+start from a fresh database, or already matched pairs are skipped and the
+matcher appears nearly free. This will silently inflate any published COLMAP
+matcher timing, ours included had we not controlled for it (\S\ref{sec:setup}).
+
+
+% =====================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% =====================================================================
+
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Environment. The dagger marks a deviation from our own protocol:
+clocks were not pinned and the device concurrently served an interactive
+desktop. Both inflate dispersion, and \S\ref{sec:notestablished} reads the
+mapping stage accordingly.}
+\label{tab:env}
+\begin{tabular}{@{}p{0.24\columnwidth}p{0.70\columnwidth}@{}}
+\toprule
+GPU & RTX 5090, Blackwell sm\_120, 170 SM, 32.6\,GB GDDR7, 3105\,MHz core,
+      14001\,MHz memory, 575\,W, persistence mode on. $\dagger$~Clocks not
+      pinned; the device also drove the interactive desktop
+      ($\approx$1.9\,GiB held) \\
+CPU & AMD Ryzen 7 9700X, 8C/16T \\
+OS & Ubuntu 24.04.4 LTS, kernel 7.0.0-29 \\
+Driver / CUDA & 610.43.02 / 13.3 (V13.3.33) \\
+Compiler / build & GCC 13.3.0; CMake 3.28.3 with Ninja 1.11.1 \\
+Architecture & \opt{CMAKE\_CUDA\_ARCHITECTURES=native}, native sm\_120 SASS,
+               no PTX JIT \\
+Profilers & Nsight Systems 2026.1.3, Nsight Compute 2026.2.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\para{Builds.} Both binaries were built from COLMAP 4.1.0.dev0 in Release mode
+(\opt{-O3 -DNDEBUG}) with CUDA, SIMD, and GUI enabled: the baseline from commit
+\opt{3104c88c}, the optimized build from commit \opt{25127dad} on branch
+\opt{gpu-opt-sift}. Two build options are consequential.
+mapping does not use the GPU in this build and is untouched by the
+optimization; \S\ref{sec:endtoend} treats this as a property of the
+configuration rather than a detail. \opt{TESTS\_ENABLED=OFF} left the unit
+tests unavailable. The released branch also carries dense-stereo memory
+changes that are outside this paper's scope and unevaluated here.
+
+\para{Data.} Timings were taken on \emph{cisp\_bemi\_2026}, a 589 image UAV
+survey at $4000 \times 3000$ (2.9\,GB, DJI FC330 at $3.61$\,mm, GPS in EXIF),
+carrying roughly $10{,}400$ features per image and matched exhaustively over all
+$173{,}166$ pairs. On this survey the baseline's quadratic intermediate is an
+$837$\,MB allocation and peak matcher memory is $1546$\,MiB, comfortably
+within this card's $32.6$\,GB, so the survey does not exercise the memory
+limit of \S\ref{sec:intro}. Matching costs $2.371$\,ms per pair at baseline
+against $1.845$\,ms optimized. Kernel-level profiling used a 40 image subset of
+\emph{south-building} at $3072 \times 2048$, exhaustively matched over $780$
+pairs.
+
+\para{Confirmation that the optimization is present.} Disassembly of the
+shipped binary contains $1024$ DP4A instructions, $512$ in each of the two
+matcher kernels, confirming that the packed dot product path of
+\S\ref{sec:matcher} is live in native sm\_120 SASS rather than merely present
+in source. This is the strongest form of the execution path assertion of
+\S\ref{sec:boundary}: it verifies the instruction rather than the code path.
+
+\para{Metrics.} We report per-stage wall clock over $n = 10$ runs
+(Table~\ref{tab:timing}) and the reconstruction statistics of
+Table~\ref{tab:quality} for one run per configuration, with reprojection error
+reported jointly with observation count and never in isolation, for the reason
+given in \S\ref{sec:trap}, and additionally reprojection error is censored:
+the mapper deletes observations beyond \opt{filter\_max\_reproj\_error}
+($4$\,px by default), so a correspondence regression surfaces as fewer
+observations, not a larger mean. We further report peak matcher GPU memory and
+per-pair GPU kernel times from Nsight Systems (Table~\ref{tab:kernels}).
+COLMAP's clamping flag and the GPU idle fraction during matching were not
+recorded; \S\ref{sec:notestablished} states what that costs.
+
+\para{Method notes.} The GPU was verified idle before each timed run, the page
+cache was pre-warmed so both builds read images warm, timed comparisons used
+byte-identical input databases, and same-binary control runs of the unmodified
+baseline were taken to establish noise floors for the nondeterministic stages.
+
+\para{Extraction is a control, not a target.} No extraction edit was applied in
+this work. Extraction timings are reported so that the stage share of matching
+can be read correctly, and because an unchanged extraction stage is a check on
+the measurement itself.
+
+
+% =====================================================================
+\section{Results}
+\label{sec:results}
+% =====================================================================
+
+\subsection{Stage timings}
+
+Table~\ref{tab:timing} reports wall clock per stage over $n = 10$ runs. The
+optimized matcher saves $91.0$\,s per run, a speedup of $1.28\times$ with $95\%$
+confidence interval $[1.26, 1.31]$ at Welch $t = 27.3$ on $17.7$ degrees of
+freedom, or $p < 10^{-15}$. Stage time falls by $22.2\%$. Extraction is
+unchanged, as expected. Mapping is nominally $211.5$\,s slower, which is $0.73$
+baseline standard deviations and therefore not distinguishable from run-to-run
+variation.
+
+\para{Where the stage gain comes from.} Table~\ref{tab:kernels} apportions the
+gain with per-pair GPU kernel times on the profiling subset. The packed dot
+product roughly halves the similarity kernel, the fused reduction removes the
+row pass almost entirely, from $318$ to $19$\,$\mu$s, and the wider tiles more
+than halve the column pass, for a $59\%$ reduction in GPU time; the optimized
+similarity kernel runs at $96.7\%$ compute and $98.1\%$ L1/TEX throughput and
+is saturated. The $59\%$ becomes $22.2\%$ at stage level because much of the
+stage's wall clock is host-side work the kernels do not govern
+(\S\ref{sec:notestablished}).
+
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Measured stage timings, mean $\pm$ standard deviation over $n = 10$
+runs. Ratio is baseline over optimized, so values above $1$ are speedups.
+Dispersions marked $^\ast$ were not recorded, so those stages cannot be tested
+formally.}
+\label{tab:timing}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Stage & Base.\ (s) & Opt.\ (s) & $\Delta$ (s) & Ratio & Share \\
+\midrule
+SIFT matching   & $410.5 \pm 7.9$    & $319.5 \pm 7.0$ & $-91.0$  & $1.28\times$ & 12.1\% \\
+SIFT extraction & $144.0 \pm 0.8$    & $143.7^\ast$    & $-0.3$   & $1.00\times$ & \phantom{0}4.3\% \\
+Mapping         & $2830.8 \pm 288.2$ & $3042.3^\ast$   & $+211.5$ & $0.93\times$ & 83.6\% \\
+\midrule
+End-to-end      & $3385.3 \pm 288.3$ & $3505.5$        & $+120.2$ & $0.97\times$ & 100\%\phantom{.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Per-pair GPU kernel time on the \emph{south-building} profiling
+subset ($780$ pairs, Nsight Systems). The baseline similarity kernel was pinned
+at $84.7\%$ SM throughput by \opt{\_\_mul24} emulation.}
+\label{tab:kernels}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Kernel & Base.\ ($\mu$s) & Opt.\ ($\mu$s) \\
+\midrule
+Similarity (\opt{MultiplyDescriptor}) & 858 & 468 \\
+Row reduction (\opt{RowMatch})        & 318 & 19 \\
+Column reduction (\opt{ColMatch})     & 320 & 132 \\
+\midrule
+Total per pair                         & 1496 & 619 \\
+All $780$ pairs (ms)                   & 1166 & 483 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The gain does not survive to end-to-end time}
+\label{sec:endtoend}
+
+This is the principal empirical result.
+
+Matching is $12.1\%$ of baseline runtime, so eliminating it \emph{entirely}
+would cut total time by $12.1\%$, a factor of $1.14\times$. At the measured
+$1.28\times$ the matcher takes $319.5$\,s instead of $410.5$\,s, so a
+$3385.3$\,s pipeline would be expected to finish in $3294.3$\,s, a factor of
+$1.03\times$. The observed end-to-end ratio is $0.97\times$, a $120.2$\,s
+difference of under one standard error, and therefore not a measured regression
+either. A statistically significant $1.28\times$ improvement to the matcher
+thus produced no detectable change in end-to-end runtime.
+
+The limitation is one of measurement resolution as much as of stage share. End
+to end times are dominated by mapping, whose dispersion is $288.2$\,s, a
+coefficient of variation of $10.2\%$. At $n = 10$ runs per configuration, and
+taking the unrecorded optimized dispersion to match the baseline's, the
+standard error of an end-to-end difference is about $129$\,s, so the
+smallest change this experiment can resolve at two standard errors is roughly
+$258$\,s. The $91.0$\,s saving is well inside that, at $0.7$ standard errors.
+Resolving it would take on the order of $80$ runs per configuration rather than
+ten, and those runs would still mostly be estimating mapping variance.
+
+The bound is not absolute. Removing matching altogether would save $410.5$\,s,
+which is $3.2$ standard errors and would have been detectable here. What this
+configuration cannot resolve is an improvement of the size actually achieved, and
+that is the case the reader cares about.
+
+\para{Which regime this is.} This is not an unfavourable configuration for a
+matcher optimization. Matching was exhaustive over $589$ images, so connectivity
+is maximal, which is the case in which per-pair cost matters most. It still
+produced no end-to-end gain, because mapping accounted for $83.6\%$ of runtime.
+One qualification: mapping runs entirely on the CPU in this build, so its
+$83.6\%$ share partly reflects the absence of any GPU mapping path. Two settings in which the arithmetic would differ remain
+untested here: a global mapper \cite{pan2024global}, at roughly a third the
+mapping cost \cite{yu2025cusfm}, would at these timings raise the front end
+from $16\%$ of total runtime to about $37\%$; and a memory-bound configuration
+is worth entering at zero
+speedup, because there the fused matcher is a quality repair that happens also
+to be faster.
+
+\subsection{Reconstruction quality}
+\label{sec:quality}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\caption{Reconstruction quality, one run per configuration, with a same-binary
+rerun of the unmodified baseline as a variance control. Every quantity except
+absolute accuracy moves by at most $0.06\%$, and the control column moves for
+free.}
+\label{tab:quality}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Metric & Baseline & Optimized & Change & Base.\ rerun \\
+\midrule
+Registered images        & 585       & 585       & $0$ & 585 \\
+3D points                & 514{,}012 & 514{,}066 & $+0.011\%$ & 513{,}872 \\
+Observations             & 3{,}858{,}610 & 3{,}859{,}754 & $+0.030\%$ & 3{,}858{,}712 \\
+Mean track length        & 7.5068    & 7.5083    & $+0.020\%$ & 7.5091 \\
+Observations per image   & 6595.91   & 6597.87   & $+0.030\%$ & 6596.1 \\
+Reprojection error (px)  & 1.0055    & 1.0049    & $-0.060\%$ & 1.0049 \\
+Accuracy vs GPS (m)      & 4.544     & 4.580     & $+0.79\%$ & n/a \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Registration counts are identical at $585$ of $589$ images, every remaining
+quantity
+except absolute accuracy moves by at most $0.06\%$, and the optimized build is
+marginally ahead on points, observations, track length, and reprojection error.
+This is what \S\ref{sec:matcher} requires. The matcher's output is byte
+identical, so every movement in the table is mapper nondeterminism, and the
+rerun column exhibits the same nondeterminism with no code change at all: the
+control moves points by $140$ and track length by more than the optimized build
+does. Alignment-based comparison agrees. After aligning each pair of models,
+the median camera rotation between optimized and baseline is $0.0072^{\circ}$,
+smaller than the $0.0130^{\circ}$ between the baseline and its own rerun; the
+optimized build agrees with the baseline more closely than the baseline agrees
+with itself.
+
+Absolute accuracy degraded by $0.036$\,m, which is $0.79\%$ of a $4.5$\,m
+baseline set by consumer GPS rather than by the reconstruction. With one run per
+configuration this is not separable from the mapper's nondeterminism.
+
+\para{A necessary self-check.} Three of these movements are the signature that
+\S\ref{sec:trap} attributes to a texture-selective degradation: unchanged
+registration, longer mean tracks, and lower mean reprojection error. Reporting
+them as evidence of quality would be exactly the error this paper warns against,
+so the distinguishing evidence has to be stated rather than assumed. That
+failure mode destroys weak features and must therefore \emph{reduce}
+observations while improving their averages, whereas here observations rose by
+$1{,}144$ and points by $54$. The magnitudes are equally decisive: no
+reconstruction statistic apart from GPS accuracy moved by more than $0.06\%$,
+which no redistribution of the size \S\ref{sec:trap} contemplates could
+produce.
+
+The contrast between the two tables is itself the result. Stage time fell by
+$22.2\%$ while the largest movement in any reconstruction statistic not set by
+GPS noise was $0.06\%$, several hundred times smaller.
+
+\subsection{What these numbers do not establish}
+\label{sec:notestablished}
+
+Four limitations qualify the measurements.
+
+First, quality was measured in aggregate, one run per configuration plus one
+baseline rerun. Per-stratum fidelity (\S\ref{sec:trap}) was not evaluated,
+and the fuller run-to-run calibration of \S\ref{sec:correctness}, many seeds
+rather than a single control, was not performed, so quality is established by
+aggregate agreement and one control rather than a formal equivalence
+criterion.
+
+Second, mapping increased by $211.5$\,s against the baseline mean. Two
+independent facts attribute this to variance rather than to the optimization: a
+systematically different mapper input is excluded outright, since the match set
+is byte identical, and two runs of the unmodified baseline on this input differ
+by $408$\,s between themselves, with the divergence traced to a
+Levenberg-Marquardt ill-conditioning branch in the final global bundle
+adjustment. What remains open is only the size of mapping variance, not its
+cause.
+
+Third, dispersions for the optimized extraction and mapping runs were not
+recorded, so only the matching row of Table~\ref{tab:timing} constitutes a
+formal test. COLMAP's clamping flag and the GPU idle fraction during matching
+were not recorded either. The kernel and stage numbers bound the latter
+indirectly: on the profiling subset GPU kernel time fell $59\%$ while the
+survey's stage wall time fell $22.2\%$, so a substantial fraction of the
+stage's wall clock is host-side work and overlap with CPU geometric
+verification that the kernels do not govern, which is also why further kernel
+gains would be increasingly absorbed.
+
+Fourth, Table~\ref{tab:env} records two deviations from our own protocol: clocks
+were not pinned, and the GPU simultaneously drove an interactive desktop. Both
+inflate dispersion, and the $10.2\%$ mapping coefficient of variation is the
+expected symptom. This does not threaten the matching result, whose effect is
+$27$ standard errors, but it loosens the mapping and end-to-end figures. Unit
+tests were also unavailable (\opt{TESTS\_ENABLED=OFF}), so matcher correctness
+rests on the byte-identity check of \S\ref{sec:matcher} rather than on the
+upstream suite. That check is decisive but has a known blind spot: because the
+output is identical by construction, it confirms the exactness argument end to
+end without independently stressing it.
+
+
+% =====================================================================
+\section{A Hazard the Harness Was Built Around}
+\label{sec:trap}
+% =====================================================================
+
+This section states a failure mode that we have not measured. It shaped the
+harness design, it explains the self-check in \S\ref{sec:quality}, and it
+constrains how aggregate quality tables of the kind reported here should be read
+in general.
+
+Glacier imagery, our target domain, is texturally bimodal, and the two modes
+have opposite scientific value. Bedrock, moraine, and supraglacial debris are
+high contrast and generate abundant strong keypoints. Clean ice and firn are low
+contrast, high albedo, and frequently saturated, generating few weak keypoints
+that sit near detection thresholds. SIFT's normalization step ($L_2$ normalize,
+clamp at $0.2$, renormalize) is ill conditioned in the second case: over snow the
+pre-normalization vector has tiny norm, so normalization amplifies whatever noise
+is present, and the result is arbitrary yet unit norm, hence statistically
+indistinguishable from a good descriptor.
+
+\para{Mechanism.} Any numerical degradation, whether reduced precision, altered
+accumulation order, or a modified epsilon, displaces the weak population across
+the detection threshold or randomizes its descriptors, while the strong
+population is unaffected because its gradient energy is an order of magnitude
+larger. The degradation is selective by construction.
+
+\para{Aggregate diagnostics do not see it.} Total keypoint count changes little,
+because the strong stratum dominates it. Registered image count is unchanged.
+Mean track length may \emph{increase}, since the removed tracks are the short
+weak ones, and mean reprojection error \emph{decreases}, since the discarded
+observations carried the largest residuals. Only the point count declines. Of
+five conventional summary statistics, two improve, two hold steady, and one
+falls, so four of the five raise no alarm and two actively reassure.
+
+\para{Global set agreement is not stratum preserving.} Let the strong stratum
+supply a fraction $\rho$ of all keypoints and let a candidate preserve it exactly
+while losing a fraction $\ell$ of the weak stratum. The candidate set is then a
+subset of the baseline set, so the global keypoint Jaccard index is
+\begin{equation}
+J_{\mathrm{kp}} = 1 - (1-\rho)\,\ell .
+\label{eq:jaccard}
+\end{equation}
+For $\rho = 0.9$ and $\ell = 0.3$ this gives $J_{\mathrm{kp}} = 0.97$: a
+candidate may lose a third of its observations over the surface the survey exists
+to measure while its global agreement falls by three points. A gate at $0.995$
+admits any candidate with $\ell < 0.005/(1-\rho)$, which at $\rho = 0.9$ permits
+losing $5\%$ of the weak stratum outright, and more under any positive
+correspondence tolerance. The signal is attenuated by the factor $1-\rho$, so
+acceptance criteria must be evaluated per stratum with the minimum governing,
+rather than globally with per-stratum figures relegated to reporting.
+
+\para{Why field validation misses it too.} Glaciological SfM validates against
+control on stable off-glacier terrain, because on-ice control advects with the
+ice \cite{chudley2019high}. The validation stratum is therefore the strong one,
+which is precisely the stratum that did not degrade. Protocol and failure mode
+are adversely aligned.
+
+\para{Status.} Testing this requires a glacier survey and, on it, per-image
+masks derived from a glacier outline projected through the baseline
+reconstruction, partitioning pixels into clean ice and firn, crevasse fields,
+and bedrock and moraine. Those masks have not been constructed, and the aerial
+survey of \S\ref{sec:setup} has not itself been established to contain the
+strata in question, so \eqref{eq:jaccard} is arithmetic rather than a
+measurement, and the fidelity reported in \S\ref{sec:quality} is aggregate. The
+result of \S\ref{sec:quality} is not threatened by this, for the reason given in
+the self-check there, but a future candidate whose effect on the match set is
+larger than accumulation noise would need the stratified evaluation before it
+could be accepted.
+
+
+% =====================================================================
+\section{Limitations}
+\label{sec:limitations}
+% =====================================================================
+
+\textbf{Scope.} This work optimizes descriptor matching only. Extraction is
+reported unchanged and was not a target, and the end-to-end contribution in the
+configuration measured is nil.
+
+\textbf{Detector specificity.} The fused epilogue applies to any brute force
+matcher that materializes a similarity matrix and consumes only a per-row top
+$k$, which covers descriptors other than SIFT, including ALIKED; LightGlue
+bypasses the matcher entirely, so nothing here applies to it. Kernel-level
+tuning was nonetheless carried out against SIFT descriptor dimensions and
+feature counts, so the reported speedup should not be assumed to transfer
+unchanged. The harness, the runtime-share argument, and the hazard of
+\S\ref{sec:trap} are detector independent.
+
+\textbf{Missing baselines.} We do not report COLMAP at its best available
+configuration, nor a CUB or CUTLASS reimplementation written without an agent.
+The latter would separate the contribution of a modern library from that of the
+search, and its absence is the main thing standing between this paper and a
+claim about agentic optimization as such.
+
+\textbf{Selection bias.} Selecting on front-end fidelity and reporting
+reconstruction quality risks optimistic bias, so reconstruction-level evaluation
+must use held-out images and results should span at least three independent runs
+rather than a best of $N$.
+
+\textbf{The construct is a proxy.} Observation retention within a stratum stands
+in for ``the reconstruction still constrains that surface''; a candidate could
+preserve the count while displacing observations within the stratum.
+
+
+% =====================================================================
+\section{Conclusion}
+% =====================================================================
+
+The technical target here is well defined and, once stated plainly, almost
+obvious: a stage that writes and reads $MN$ similarities in order to keep two
+per row. The corrected implementation is faster, smaller ($700$ against
+$1546$\,MiB at peak), and byte-identical in output, and we measure it to be
+$1.28\times$ faster at $p < 10^{-15}$ with reconstruction statistics inside
+the mapper's own run-to-run spread. That gain costs nothing.
+
+It also does not reach the user, and that is a measurement rather than an
+assumption: the $91$\,s saved is a third of one standard deviation of a stage we
+never modified. We report it because the alternative is a literature of stage
+speedups that no user experiences. A kernel result in a heterogeneous pipeline
+is incomplete without the share of runtime it addresses and the dispersion of the
+stages it does not, and where the second exceeds the first, the honest
+conclusion is the one drawn here.
+
+The same reasoning applies one level down, to quality. On texturally bimodal
+imagery, a degradation confined to the weak stratum leaves four of five
+conventional summary statistics flat or improved and validates successfully
+against ground control, because that control sits on the stratum that did not
+degrade. No
+increase in agent capability detects this; only stratifying the metric does. For
+agentic optimization in scientific pipelines, the degradation of greatest
+consequence should be identified before the search procedure is built, and both
+the reward function and the validation protocol should then be examined for
+sensitivity to it. The second is the more demanding requirement, and in this work
+it remains the unfinished one.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}q. 

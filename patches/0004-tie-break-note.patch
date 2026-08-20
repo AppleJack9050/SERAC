@@ -1,0 +1,78 @@
+From d3c0136bb932e442bf7bab89bb2e12828a9ff4dc Mon Sep 17 00:00:00 2001
+From: applejack9050 <applejack9050@gmail.com>
+Date: Wed, 19 Aug 2026 02:54:56 -0300
+Subject: [PATCH 4/4] feature: correct the tie-break note on the fused row
+ reduction
+
+The comments claimed the fused reduction reproduced the original row
+scan's tie-break. It does not. The old RowMatch_Kernel scanned a row
+strided across 32 threads and its tree reduction kept the lower thread
+on a tie, so the surviving column was the one with the smallest
+(col % 32); the fused version returns the smallest column outright.
+
+This cannot change a reported match for max_ratio <= 1, which includes
+COLMAP's default of 0.8: a top-1 tie makes second_best == best, so the
+ratio test dist < distn * ratiomax is false and neither version emits a
+match. max_ratio > 1 is legal (Check() only enforces > 0) and there the
+two can return different column indices.
+
+Comment-only; no code change. Found by an adversarial audit that
+compiled both kernel versions and probed tied rows directly.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/thirdparty/SiftGPU/ProgramCU.cu | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/src/thirdparty/SiftGPU/ProgramCU.cu b/src/thirdparty/SiftGPU/ProgramCU.cu
+index 688974e3..796d71cf 100644
+--- a/src/thirdparty/SiftGPU/ProgramCU.cu
++++ b/src/thirdparty/SiftGPU/ProgramCU.cu
+@@ -1434,7 +1434,17 @@ __device__ __forceinline__ unsigned int SiftDotChunk16(const unsigned int* p1,
+ }
+ 
+ // Merge two (best, best_index, second_best) triples. `a` wins ties, so the
+-// smallest index survives -- the same preference the scalar row scan had.
++// smallest index survives.
++//
++// NOTE: this is NOT the tie-break the kernel it replaces used. The old
++// RowMatch_Kernel scanned a row strided over 32 threads (thread t took columns
++// t, t+32, ...) and its tree reduction kept the lower THREAD on a tie, so the
++// surviving column was the one with the smallest (col % 32), not the smallest
++// column. The difference is unobservable for max_ratio <= 1: a top-1 tie makes
++// second_best == best, so the ratio test `dist < distn * ratiomax` is false and
++// neither version reports a match. COLMAP's default max_ratio is 0.8. With
++// max_ratio > 1 -- legal, only checked > 0 -- the two can return different
++// column indices for a tied row.
+ __device__ __forceinline__ int3 MergeBest(const int3& a, const int3& b)
+ {
+ 	return a.x < b.x ? make_int3(b.x, b.y, max(a.x, b.z))
+@@ -1513,9 +1523,10 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ 	// The full num1 x num2 dot matrix never reaches memory: RowMatch_Kernel
+ 	// finishes the job by merging the gridDim.x partials of each row. Seeding
+ 	// each lane from the identity (0, -1, 0) and keeping `a` on ties in
+-	// MergeBest reproduces the original row scan exactly -- it too started at
+-	// zero with index -1 and advanced only on a strict increase, so a zero dot
+-	// product still never matches and the lowest column still wins.
++	// MergeBest reproduces the original row scan's value semantics -- it too
++	// started at zero with index -1 and advanced only on a strict increase, so a
++	// zero dot product still never matches. The tie-break on the returned index
++	// differs; see the note on MergeBest.
+ 	// Every thread must reach this, so no lane may return early above.
+ 	__shared__ int3 row_partial[(MULT_TBLOCK_DIMX / 32) * MULT_BLOCK_DIMY];
+ 	{
+@@ -1778,8 +1789,9 @@ void ProgramCU::MultiplyDescriptorG(CuTexImage* des1, CuTexImage* des2,
+ 
+ // Each row already arrived reduced to one triple per column-block, so this only
+ // has to merge gridDim.x of them per row. Merging in increasing block order and
+-// keeping `a` on ties preserves the lowest-column-wins rule of the original
+-// full-row scan.
++// keeping `a` on ties makes the smallest column win. The original strided scan
++// broke exact ties differently; see the note on MergeBest for why that cannot
++// change a reported match for max_ratio <= 1.
+ void __global__  RowMatch_Kernel(int3* d_row, int* d_result, int num1, int width, float distmax, float ratiomax)
+ {
+ 	int row = IMUL(blockIdx.x, ROWMATCH_BLOCK_WIDTH) + threadIdx.x;
+-- 
+2.43.0
+

@@ -1,0 +1,476 @@
+From 4a4182e644673ef79e26746b9efe7cb921c7a157 Mon Sep 17 00:00:00 2001
+From: applejack9050 <applejack9050@gmail.com>
+Date: Tue, 18 Aug 2026 22:49:37 -0300
+Subject: [PATCH 2/4] feature: fuse SIFT match row reduction, drop the full dot
+ matrix
+
+MultiplyDescriptor_Kernel wrote a complete num1 x num2 matrix of
+descriptor inner products to global memory, and RowMatch_Kernel read all
+of it back just to take a best/second-best per row. That round trip
+dominated the matcher: after the DP4A change ncu showed the multiply
+kernel memory-bound at 95.2% with DRAM at 55.7%.
+
+The column direction already avoided this -- each block reduced its 8
+rows into one triple per column and ColMatch_Kernel merged the partials.
+Do the same in the row direction: reduce each block's 128 columns to one
+(best, index, second_best) triple per row with warp shuffles, and let
+RowMatch_Kernel merge the gridDim.x partials. The dot matrix is never
+materialized.
+
+_texDot is replaced by _texRRT, which is allocated as max_sift x
+ceil(max_sift/128) triples rather than max_sift squared ints. That
+buffer scaled quadratically with the feature count and was by far the
+largest allocation in the matcher.
+
+Exactness: seeding each lane from the identity (0, -1, 0) and keeping
+the left operand on ties in MergeBest reproduces the original scan,
+which also started at zero with index -1 and advanced only on a strict
+increase. So a zero dot product still never matches, the lowest column
+index still wins ties, and the guided kernel's rejected pairs are still
+clamped with max(.., 0). The reduction is inlined rather than factored
+into a helper taking `results` by pointer, because passing a local array
+to a callee is the pattern NVCC miscompiles on Blackwell (#3514).
+
+RTX 5090 (sm_120), 40 images of south-building, 780 pairs:
+  RowMatch_Kernel            315us -> 25us   (-92%)
+  MultiplyDescriptor_Kernel  667us -> 629us
+  matching GPU total        1015ms -> 768ms
+  matcher peak GPU memory   1762MiB -> 952MiB (-46%)
+Against the unmodified matcher the totals are 1166ms -> 768ms (-34%).
+
+Match counts are identical to the original, 201757 over 780 pairs.
+End-to-end on 20 images both register 20/20 at 0.552 vs 0.553 px mean
+reprojection error; that spread and the two_view_geometries counts stay
+inside the run-to-run RANSAC noise of the unmodified binary.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/thirdparty/SiftGPU/ProgramCU.cu    | 217 ++++++++++++++-----------
+ src/thirdparty/SiftGPU/ProgramCU.h     |   6 +-
+ src/thirdparty/SiftGPU/SiftMatchCU.cpp |  12 +-
+ src/thirdparty/SiftGPU/SiftMatchCU.h   |   2 +-
+ 4 files changed, 138 insertions(+), 99 deletions(-)
+
+diff --git a/src/thirdparty/SiftGPU/ProgramCU.cu b/src/thirdparty/SiftGPU/ProgramCU.cu
+index 1d55fe77..6fdf6a6f 100644
+--- a/src/thirdparty/SiftGPU/ProgramCU.cu
++++ b/src/thirdparty/SiftGPU/ProgramCU.cu
+@@ -1433,7 +1433,30 @@ __device__ __forceinline__ unsigned int SiftDotChunk16(const unsigned int* p1,
+ 	return sum;
+ }
+ 
+-void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextureObject_t texDes2, int* d_result, int num1, int num2, int3* d_temp)
++// Merge two (best, best_index, second_best) triples. `a` wins ties, so the
++// smallest index survives -- the same preference the scalar row scan had.
++__device__ __forceinline__ int3 MergeBest(const int3& a, const int3& b)
++{
++	return a.x < b.x ? make_int3(b.x, b.y, max(a.x, b.z))
++	                 : make_int3(a.x, a.y, max(a.z, b.x));
++}
++
++// Reduce a triple across one warp. Lower lanes hold lower column indices.
++__device__ __forceinline__ int3 WarpReduceBest(int3 r)
++{
++#pragma unroll
++	for(int off = 16; off > 0; off >>= 1)
++	{
++		int3 o;
++		o.x = __shfl_down_sync(0xffffffffu, r.x, off);
++		o.y = __shfl_down_sync(0xffffffffu, r.y, off);
++		o.z = __shfl_down_sync(0xffffffffu, r.z, off);
++		r = MergeBest(r, o);
++	}
++	return r;
++}
++
++void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextureObject_t texDes2, int3* d_row, int num1, int num2, int3* d_temp)
+ {
+ 	int idx01 = (blockIdx.y  * MULT_BLOCK_DIMY),  idx02 = (blockIdx.x  * MULT_BLOCK_DIMX);
+ 
+@@ -1463,7 +1486,7 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ 	__syncthreads();
+ 
+ 	///
+-	if(idx2 >= num2) return;
++	const bool valid = (idx2 < num2);
+ 	///////////////////////////////////////////////////////////////////////////
+ 	//compare descriptors
+ 
+@@ -1471,6 +1494,8 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ #pragma unroll
+ 	for(int i = 0; i < MULT_BLOCK_DIMY; ++i) results[i] = 0;
+ 
++	if(valid)
++	{
+ #pragma unroll
+ 	for(int i = 0; i < 8; ++i)
+ 	{
+@@ -1482,9 +1507,41 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ 			results[k] = (int)SiftDotChunk16(p1, v, (unsigned int)results[k]);
+ 		}
+ 	}
++	}
+ 
+-	int dst_idx = IMUL(idx1, num2)  + idx2;
+-	if(d_temp)
++	// ---- fold this block's columns into one triple per row ----------------
++	// The full num1 x num2 dot matrix never reaches memory: RowMatch_Kernel
++	// finishes the job by merging the gridDim.x partials of each row. Seeding
++	// each lane from the identity (0, -1, 0) and keeping `a` on ties in
++	// MergeBest reproduces the original row scan exactly -- it too started at
++	// zero with index -1 and advanced only on a strict increase, so a zero dot
++	// product still never matches and the lowest column still wins.
++	// Every thread must reach this, so no lane may return early above.
++	__shared__ int3 row_partial[(MULT_TBLOCK_DIMX / 32) * MULT_BLOCK_DIMY];
++	{
++		const int lane = threadIdx.x & 31;
++		const int warp = threadIdx.x >> 5;
++#pragma unroll
++		for(int k = 0; k < MULT_BLOCK_DIMY; ++k)
++		{
++			int3 r = make_int3(0, -1, 0);
++			if(valid) r = MergeBest(r, make_int3(max(results[k], 0), idx2, 0));
++			r = WarpReduceBest(r);
++			if(lane == 0) row_partial[IMUL(warp, MULT_BLOCK_DIMY) + k] = r;
++		}
++	}
++	__syncthreads();
++	if(threadIdx.x < MULT_BLOCK_DIMY)
++	{
++		const int k = threadIdx.x;
++		int3 r = row_partial[k];
++#pragma unroll
++		for(int w = 1; w < MULT_TBLOCK_DIMX / 32; ++w)
++			r = MergeBest(r, row_partial[IMUL(w, MULT_BLOCK_DIMY) + k]);
++		if(idx01 + k < num1) d_row[IMUL(blockIdx.x, num1) + idx01 + k] = r;
++	}
++
++	if(valid && d_temp)
+ 	{
+ 		int3 cmp_result = make_int3(0, -1, 0);
+ 
+@@ -1496,35 +1553,29 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ 				cmp_result = results[i] > cmp_result.x?
+ 				make_int3(results[i], idx1 + i, cmp_result.x) :
+ 				make_int3(cmp_result.x, cmp_result.y, max(cmp_result.z, results[i]));
+-				d_result[dst_idx + IMUL(i, num2)] = results[i];
+ 			}
+ 		}
+ 		d_temp[ IMUL(blockIdx.y, num2) + idx2] = cmp_result;
+-	}else
+-	{
+-#pragma unroll
+-		for(int i = 0; i < MULT_BLOCK_DIMY; ++i)
+-		{
+-			if(idx1 + i < num1) d_result[dst_idx + IMUL(i, num2)] = results[i];
+-		}
+ 	}
+ 
+ }
+ 
+ 
+-void ProgramCU::MultiplyDescriptor(CuTexImage* des1, CuTexImage* des2, CuTexImage* texDot, CuTexImage* texCRT)
++void ProgramCU::MultiplyDescriptor(CuTexImage* des1, CuTexImage* des2, CuTexImage* texRRT, CuTexImage* texCRT)
+ {
+ 	int num1 = des1->GetImgWidth() / 8;
+ 	int num2 = des2->GetImgWidth() / 8;
+ 	dim3 grid(	(num2 + MULT_BLOCK_DIMX - 1)/ MULT_BLOCK_DIMX,
+ 		(num1 + MULT_BLOCK_DIMY - 1)/MULT_BLOCK_DIMY);
+ 	dim3 block(MULT_TBLOCK_DIMX, MULT_TBLOCK_DIMY);
+-	texDot->InitTexture( num2,num1);
++	// One (best, index, second_best) triple per row per column-block, instead of
++	// the full num1 x num2 dot matrix.
++	texRRT->InitTexture( num1, (num2 + MULT_BLOCK_DIMX - 1)/MULT_BLOCK_DIMX, 32);
+ 	if(texCRT) texCRT->InitTexture(num2, (num1 + MULT_BLOCK_DIMY - 1)/MULT_BLOCK_DIMY, 32);
+ 	CuTexImage::CuTexObj des1Tex = des1->BindTexture(texDataDesc, cudaCreateChannelDesc<uint4>());
+ 	CuTexImage::CuTexObj des2Tex = des2->BindTexture(texDataDesc, cudaCreateChannelDesc<uint4>());
+ 
+-	MultiplyDescriptor_Kernel<<<grid, block>>>(des1Tex.handle, des2Tex.handle, (int*)texDot->_cuData, num1, num2,
++	MultiplyDescriptor_Kernel<<<grid, block>>>(des1Tex.handle, des2Tex.handle, (int3*)texRRT->_cuData, num1, num2,
+ 												(texCRT? (int3*)texCRT->_cuData : NULL));
+ }
+ 
+@@ -1537,7 +1588,7 @@ struct Matrix33
+ 
+ void __global__ MultiplyDescriptorG_Kernel(cudaTextureObject_t texDes1, cudaTextureObject_t texDes2,
+ 										   cudaTextureObject_t texLoc1, cudaTextureObject_t texLoc2, 
+-										   int* d_result, int num1, int num2, int3* d_temp,
++										   int3* d_row, int num1, int num2, int3* d_temp,
+ 										   Matrix33 H, float hdistmax, Matrix33 F, float fdistmax)
+ {
+ 	int idx01 = (blockIdx.y  * MULT_BLOCK_DIMY);
+@@ -1575,8 +1626,12 @@ void __global__ MultiplyDescriptorG_Kernel(cudaTextureObject_t texDes1, cudaText
+ 		loc1[threadIdx.x] = tex1Dfetch<float>(texLoc1, 2 * idx01 + threadIdx.x);
+ 	}
+ 	__syncthreads();
+-	if(idx2 >= num2) return;
++	const bool valid = (idx2 < num2);
+ 	int results[MULT_BLOCK_DIMY];
++#pragma unroll
++	for(int i = 0; i < MULT_BLOCK_DIMY; ++i) results[i] = 0;
++	if(valid)
++	{
+ 	/////////////////////////////////////////////////////////////////////////////////////////////
+ 	//geometric verification
+ 	/////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1640,8 +1695,37 @@ void __global__ MultiplyDescriptorG_Kernel(cudaTextureObject_t texDes1, cudaText
+ 			}
+ 		}
+ 	}
+-	int dst_idx = IMUL(idx1, num2)  + idx2;
+-	if(d_temp)
++	}
++
++	// ---- fold this block's columns into one triple per row ----------------
++	// See MultiplyDescriptor_Kernel for why the identity seed and the tie rule
++	// reproduce the original row scan. Rejected pairs carry -262144 here, and
++	// the original clamped them with max(.., 0) on the way out, so clamp too.
++	__shared__ int3 row_partial[(MULT_TBLOCK_DIMX / 32) * MULT_BLOCK_DIMY];
++	{
++		const int lane = threadIdx.x & 31;
++		const int warp = threadIdx.x >> 5;
++#pragma unroll
++		for(int k = 0; k < MULT_BLOCK_DIMY; ++k)
++		{
++			int3 r = make_int3(0, -1, 0);
++			if(valid) r = MergeBest(r, make_int3(max(results[k], 0), idx2, 0));
++			r = WarpReduceBest(r);
++			if(lane == 0) row_partial[IMUL(warp, MULT_BLOCK_DIMY) + k] = r;
++		}
++	}
++	__syncthreads();
++	if(threadIdx.x < MULT_BLOCK_DIMY)
++	{
++		const int k = threadIdx.x;
++		int3 r = row_partial[k];
++#pragma unroll
++		for(int w = 1; w < MULT_TBLOCK_DIMX / 32; ++w)
++			r = MergeBest(r, row_partial[IMUL(w, MULT_BLOCK_DIMY) + k]);
++		if(idx01 + k < num1) d_row[IMUL(blockIdx.x, num1) + idx01 + k] = r;
++	}
++
++	if(valid && d_temp)
+ 	{
+ 		int3 cmp_result = make_int3(0, -1, 0);
+ #pragma unroll
+@@ -1652,28 +1736,19 @@ void __global__ MultiplyDescriptorG_Kernel(cudaTextureObject_t texDes1, cudaText
+ 				cmp_result = results[i] > cmp_result.x?
+ 				make_int3(results[i], idx1 + i, cmp_result.x) :
+ 				make_int3(cmp_result.x, cmp_result.y, max(cmp_result.z, results[i]));
+-				d_result[dst_idx + IMUL(i, num2)] = max(results[i], 0);
+ 			}else
+ 			{
+ 				break;
+ 			}
+ 		}
+ 		d_temp[ IMUL(blockIdx.y, num2) + idx2] = cmp_result;
+-	}else
+-	{
+-#pragma unroll
+-		for(int i = 0; i < MULT_BLOCK_DIMY; ++i)
+-		{
+-			if(idx1 + i < num1) d_result[dst_idx + IMUL(i, num2)] = max(results[i], 0);
+-			else break;
+-		}
+ 	}
+ 
+ }
+ 
+ 
+ void ProgramCU::MultiplyDescriptorG(CuTexImage* des1, CuTexImage* des2,
+-		CuTexImage* loc1, CuTexImage* loc2, CuTexImage* texDot, CuTexImage* texCRT,
++		CuTexImage* loc1, CuTexImage* loc2, CuTexImage* texRRT, CuTexImage* texCRT,
+ 		float* H, float hdistmax, float* F, float fdistmax)
+ {
+ 	int num1 = des1->GetImgWidth() / 8;
+@@ -1687,89 +1762,49 @@ void ProgramCU::MultiplyDescriptorG(CuTexImage* des1, CuTexImage* des2,
+ 		(num1 + MULT_BLOCK_DIMY - 1)/MULT_BLOCK_DIMY);
+ 	dim3 block(MULT_TBLOCK_DIMX, MULT_TBLOCK_DIMY);
+ 	//intermediate results
+-	texDot->InitTexture( num2,num1);
++	texRRT->InitTexture( num1, (num2 + MULT_BLOCK_DIMX - 1)/MULT_BLOCK_DIMX, 32);
+ 	if(texCRT) texCRT->InitTexture( num2, (num1 + MULT_BLOCK_DIMY - 1)/MULT_BLOCK_DIMY, 3);
+ 	CuTexImage::CuTexObj loc1Tex = loc1->BindTexture(texDataDesc, cudaCreateChannelDesc<float>());
+ 	CuTexImage::CuTexObj loc2Tex = loc2->BindTexture(texDataDesc, cudaCreateChannelDesc<float2>());
+ 	CuTexImage::CuTexObj des1Tex = des1->BindTexture(texDataDesc, cudaCreateChannelDesc<uint4>());
+ 	CuTexImage::CuTexObj des2Tex = des2->BindTexture(texDataDesc, cudaCreateChannelDesc<uint4>());
+ 	MultiplyDescriptorG_Kernel<<<grid, block>>>(des1Tex.handle, des2Tex.handle, loc1Tex.handle, loc2Tex.handle,
+-												(int*)texDot->_cuData, num1, num2,
++												(int3*)texRRT->_cuData, num1, num2,
+ 												(texCRT? (int3*)texCRT->_cuData : NULL),
+ 												MatH, hdistmax, MatF, fdistmax);
+ }
+ 
+ #define ROWMATCH_BLOCK_WIDTH 32
+-#define ROWMATCH_BLOCK_HEIGHT 1
+ 
+-void __global__  RowMatch_Kernel(int*d_dot, int* d_result, int num2, float distmax, float ratiomax)
++// Each row already arrived reduced to one triple per column-block, so this only
++// has to merge gridDim.x of them per row. Merging in increasing block order and
++// keeping `a` on ties preserves the lowest-column-wins rule of the original
++// full-row scan.
++void __global__  RowMatch_Kernel(int3* d_row, int* d_result, int num1, int width, float distmax, float ratiomax)
+ {
+-#if ROWMATCH_BLOCK_HEIGHT == 1
+-	__shared__ int dotmax[ROWMATCH_BLOCK_WIDTH];
+-	__shared__ int dotnxt[ROWMATCH_BLOCK_WIDTH];
+-	__shared__ int dotidx[ROWMATCH_BLOCK_WIDTH];
+-	int	row = blockIdx.y;
+-#else
+-	__shared__ int x_dotmax[ROWMATCH_BLOCK_HEIGHT][ROWMATCH_BLOCK_WIDTH];
+-	__shared__ int x_dotnxt[ROWMATCH_BLOCK_HEIGHT][ROWMATCH_BLOCK_WIDTH];
+-	__shared__ int x_dotidx[ROWMATCH_BLOCK_HEIGHT][ROWMATCH_BLOCK_WIDTH];
+-	int*	dotmax = x_dotmax[threadIdx.y];
+-	int*	dotnxt = x_dotnxt[threadIdx.y];
+-	int*	dotidx = x_dotidx[threadIdx.y];
+-	int row = IMUL(blockIdx.y, ROWMATCH_BLOCK_HEIGHT) + threadIdx.y;
+-#endif
+-
+-	int base_address = IMUL(row , num2);
+-	int t_dotmax = 0, t_dotnxt = 0, t_dotidx = -1;
+-	for(int i = 0; i < num2; i += ROWMATCH_BLOCK_WIDTH)
+-	{
+-		if(threadIdx.x + i < num2)
+-		{
+-			int v = d_dot[base_address + threadIdx.x + i];  // tex1Dfetch(texDOT, base_address + threadIdx.x + i);
+-			bool test = v > t_dotmax;
+-			t_dotnxt = test? t_dotmax : max(t_dotnxt, v);
+-			t_dotidx = test? (threadIdx.x + i) : t_dotidx;
+-			t_dotmax = test? v: t_dotmax;
+-		}
+-		__syncthreads();
+-	}
+-	dotmax[threadIdx.x] = t_dotmax;
+-	dotnxt[threadIdx.x] = t_dotnxt;
+-	dotidx[threadIdx.x] = t_dotidx;
+-	__syncthreads();
++	int row = IMUL(blockIdx.x, ROWMATCH_BLOCK_WIDTH) + threadIdx.x;
++	if(row >= num1) return;
+ 
+-#pragma unroll
+-	for(int step = ROWMATCH_BLOCK_WIDTH/2; step >0; step /= 2)
+-	{
+-		if(threadIdx.x < step)
+-		{
+-			int v1 = dotmax[threadIdx.x], v2 = dotmax[threadIdx.x + step];
+-			bool test =  v2 > v1;
+-			dotnxt[threadIdx.x] = test? max(v1, dotnxt[threadIdx.x + step]) :max(dotnxt[threadIdx.x], v2);
+-			dotidx[threadIdx.x] = test? dotidx[threadIdx.x + step] : dotidx[threadIdx.x];
+-			dotmax[threadIdx.x] = test? v2 : v1;
+-		}
+-		__syncthreads();
+-	}
+-	if(threadIdx.x == 0)
++	int3 result = d_row[row];
++	for(int i = 1; i < width; ++i)
+ 	{
+-		float dist =  acos(min(dotmax[0] * 0.000003814697265625f, 1.0));
+-		float distn = acos(min(dotnxt[0] * 0.000003814697265625f, 1.0));
+-		//float ratio = dist / distn;
+-		d_result[row] = (dist < distmax) && (dist < distn * ratiomax) ? dotidx[0] : -1;//?  : -1;
++		result = MergeBest(result, d_row[IMUL(i, num1) + row]);
+ 	}
+ 
++	float dist =  acos(min(result.x * 0.000003814697265625f, 1.0));
++	float distn = acos(min(result.z * 0.000003814697265625f, 1.0));
++	d_result[row] = (dist < distmax) && (dist < distn * ratiomax) ? result.y : -1;
+ }
+ 
+ 
+-void ProgramCU::GetRowMatch(CuTexImage* texDot, CuTexImage* texMatch, float distmax, float ratiomax)
++void ProgramCU::GetRowMatch(CuTexImage* texRRT, CuTexImage* texMatch, float distmax, float ratiomax)
+ {
+-	int num1 = texDot->GetImgHeight();
+-	int num2 = texDot->GetImgWidth();
+-	dim3 grid(1, num1/ROWMATCH_BLOCK_HEIGHT);
+-	dim3 block(ROWMATCH_BLOCK_WIDTH, ROWMATCH_BLOCK_HEIGHT);
+-	RowMatch_Kernel<<<grid, block>>>((int*)texDot->_cuData,
+-		(int*)texMatch->_cuData, num2, distmax, ratiomax);
++	int num1 = texRRT->GetImgWidth();
++	int width = texRRT->GetImgHeight();
++	dim3 grid((num1 + ROWMATCH_BLOCK_WIDTH - 1) / ROWMATCH_BLOCK_WIDTH, 1);
++	dim3 block(ROWMATCH_BLOCK_WIDTH, 1);
++	RowMatch_Kernel<<<grid, block>>>((int3*)texRRT->_cuData,
++		(int*)texMatch->_cuData, num1, width, distmax, ratiomax);
+ }
+ 
+ #define COLMATCH_BLOCK_WIDTH 32
+diff --git a/src/thirdparty/SiftGPU/ProgramCU.h b/src/thirdparty/SiftGPU/ProgramCU.h
+index 13b378d4..9771e332 100644
+--- a/src/thirdparty/SiftGPU/ProgramCU.h
++++ b/src/thirdparty/SiftGPU/ProgramCU.h
+@@ -61,11 +61,11 @@ public:
+ 	static void DisplayKeyBox(CuTexImage* ftex, CuTexImage* out);
+ 
+ 	//SIFTMATCH FUNCTIONS
+-	static void MultiplyDescriptor(CuTexImage* tex1, CuTexImage* tex2, CuTexImage* texDot, CuTexImage* texCRT);
++	static void MultiplyDescriptor(CuTexImage* tex1, CuTexImage* tex2, CuTexImage* texRRT, CuTexImage* texCRT);
+ 	static void MultiplyDescriptorG(CuTexImage* texDes1, CuTexImage* texDes2,
+-		CuTexImage* texLoc1, CuTexImage* texLoc2, CuTexImage* texDot, CuTexImage* texCRT,
++		CuTexImage* texLoc1, CuTexImage* texLoc2, CuTexImage* texRRT, CuTexImage* texCRT,
+ 		float* H, float hdistmax, float* F, float fdistmax);
+-	static void GetRowMatch(CuTexImage* texDot, CuTexImage* texMatch, float distmax, float ratiomax);
++	static void GetRowMatch(CuTexImage* texRRT, CuTexImage* texMatch, float distmax, float ratiomax);
+ 	static void GetColMatch(CuTexImage* texCRT, CuTexImage* texMatch, float distmax, float ratiomax);
+ };
+ 
+diff --git a/src/thirdparty/SiftGPU/SiftMatchCU.cpp b/src/thirdparty/SiftGPU/SiftMatchCU.cpp
+index 5e07d7cc..cbb948cd 100644
+--- a/src/thirdparty/SiftGPU/SiftMatchCU.cpp
++++ b/src/thirdparty/SiftGPU/SiftMatchCU.cpp
+@@ -62,7 +62,11 @@ bool SiftMatchCU::Allocate(int max_sift, int mbm) {
+     }
+   }
+ 
+-  if (!_texDot.InitTexture(__max_sift, __max_sift) ||
++  // Row-reduction table: one (best, index, second_best) triple per row per
++  // column-block. This replaces the full __max_sift x __max_sift dot matrix,
++  // which grew quadratically with the feature count and dominated matcher VRAM.
++  const int row_cols = (__max_sift + MULT_BLOCK_DIMX - 1) / MULT_BLOCK_DIMX;
++  if (!_texRRT.InitTexture(__max_sift, row_cols, 32) ||
+       !_texMatch[0].InitTexture(__max_sift, 1)) {
+     return false;
+   }
+@@ -153,7 +157,7 @@ int SiftMatchCU::GetGuidedSiftMatch(int max_match, uint32_t match_buffer[][2],
+   if (_num_sift[0] <= 0 || _num_sift[1] <= 0) return 0;
+   if (_have_loc[0] == 0 || _have_loc[1] == 0) return 0;
+   ProgramCU::MultiplyDescriptorG(_texDes, _texDes + 1, _texLoc, _texLoc + 1,
+-                                 &_texDot, (mbm ? &_texCRT : NULL), H, hdistmax,
++                                 &_texRRT, (mbm ? &_texCRT : NULL), H, hdistmax,
+                                  F, fdistmax);
+   return GetBestMatch(max_match, match_buffer, distmax, ratiomax, mbm);
+ }
+@@ -162,7 +166,7 @@ int SiftMatchCU::GetSiftMatch(int max_match, uint32_t match_buffer[][2],
+                               float distmax, float ratiomax, int mbm) {
+   if (_initialized == 0) return 0;
+   if (_num_sift[0] <= 0 || _num_sift[1] <= 0) return 0;
+-  ProgramCU::MultiplyDescriptor(_texDes, _texDes + 1, &_texDot,
++  ProgramCU::MultiplyDescriptor(_texDes, _texDes + 1, &_texRRT,
+                                 (mbm ? &_texCRT : NULL));
+   return GetBestMatch(max_match, match_buffer, distmax, ratiomax, mbm);
+ }
+@@ -173,7 +177,7 @@ int SiftMatchCU::GetBestMatch(int max_match, uint32_t match_buffer[][2],
+   int *buffer1 = (int*)&sift_buffer[0],
+       *buffer2 = (int*)&sift_buffer[_num_sift[0]];
+   _texMatch[0].InitTexture(_num_sift[0], 1);
+-  ProgramCU::GetRowMatch(&_texDot, _texMatch, distmax, ratiomax);
++  ProgramCU::GetRowMatch(&_texRRT, _texMatch, distmax, ratiomax);
+   _texMatch[0].CopyToHost(buffer1);
+   if (mbm) {
+     _texMatch[1].InitTexture(_num_sift[1], 1);
+diff --git a/src/thirdparty/SiftGPU/SiftMatchCU.h b/src/thirdparty/SiftGPU/SiftMatchCU.h
+index 93f5c9b1..bc789e02 100644
+--- a/src/thirdparty/SiftGPU/SiftMatchCU.h
++++ b/src/thirdparty/SiftGPU/SiftMatchCU.h
+@@ -32,7 +32,7 @@ private:
+ 	//tex storage
+ 	CuTexImage _texLoc[2];
+ 	CuTexImage _texDes[2];
+-	CuTexImage _texDot;
++	CuTexImage _texRRT;
+ 	CuTexImage _texMatch[2];
+ 	CuTexImage _texCRT;
+ 
+-- 
+2.43.0
+

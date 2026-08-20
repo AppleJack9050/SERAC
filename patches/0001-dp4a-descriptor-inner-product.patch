@@ -1,0 +1,115 @@
+From b60a0334ed0b64287266a0b8ffdd80899442acc9 Mon Sep 17 00:00:00 2001
+From: applejack9050 <applejack9050@gmail.com>
+Date: Tue, 18 Aug 2026 22:41:40 -0300
+Subject: [PATCH 1/4] feature: use DP4A for SIFT descriptor matching inner
+ product
+
+The brute-force descriptor matcher computed each 128-dim inner product
+as 128 scalar __mul24 calls. __mul24 has not been a native instruction
+since Fermi, so it lowers to an emulation sequence on the FMA pipe, and
+ncu showed MultiplyDescriptor_Kernel pinned at 84.7% SM throughput with
+"Shared FMA Heavy" as the top pipeline.
+
+Fold each group of four byte products into a single __dp4a. Descriptors
+are unsigned chars accumulated into a 32-bit integer, so no term can
+overflow and the result is bit-identical to the scalar form; the scalar
+path is kept for pre-sm_61 targets.
+
+On an RTX 5090 (sm_120), 40 images of south-building, 780 pairs:
+MultiplyDescriptor_Kernel 858us -> 667us (-22.3%), matching GPU time
+1166ms -> 1015ms, registers/thread 128 -> 77, occupancy 30.9% -> 42.1%.
+The kernel flips from compute-bound (SM 84.7%) to memory-bound
+(memory 95.2%, SM 31.3%).
+
+Raw match counts are identical (201757 over 780 pairs). The
+two_view_geometries row count moves by 65, which is below the 145-row
+spread between two runs of the unmodified binary (RANSAC is stochastic).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/thirdparty/SiftGPU/ProgramCU.cu | 49 +++++++++++++++++------------
+ 1 file changed, 29 insertions(+), 20 deletions(-)
+
+diff --git a/src/thirdparty/SiftGPU/ProgramCU.cu b/src/thirdparty/SiftGPU/ProgramCU.cu
+index ee3d0d80..1d55fe77 100644
+--- a/src/thirdparty/SiftGPU/ProgramCU.cu
++++ b/src/thirdparty/SiftGPU/ProgramCU.cu
+@@ -1408,6 +1408,31 @@ int ProgramCU::CheckCudaDevice(int device)
+ #define MULT_BLOCK_DIMX (MULT_TBLOCK_DIMX)
+ #define MULT_BLOCK_DIMY (8 * MULT_TBLOCK_DIMY)
+ 
++// Dot product of two 16-byte descriptor chunks, each held as four 32-bit words
++// packing four unsigned bytes, accumulated into `sum`.
++//
++// On sm_61 and newer this lowers to four native DP4A instructions in place of
++// the 16 scalar byte multiplies it replaces. Both operands are unsigned chars
++// and the accumulator is 32-bit, so no term can overflow and the result is
++// bit-identical to the scalar form below.
++__device__ __forceinline__ unsigned int SiftDotChunk16(const unsigned int* p1,
++                                                       const uint4& v,
++                                                       unsigned int sum)
++{
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
++	sum = __dp4a(p1[0], v.x, sum);
++	sum = __dp4a(p1[1], v.y, sum);
++	sum = __dp4a(p1[2], v.z, sum);
++	sum = __dp4a(p1[3], v.w, sum);
++#else
++	const unsigned char* b1 = (const unsigned char*)p1;
++	const unsigned char* b2 = (const unsigned char*)(&v);
++#pragma unroll
++	for(int j = 0; j < 16; ++j) sum += IMUL(b1[j], b2[j]);
++#endif
++	return sum;
++}
++
+ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextureObject_t texDes2, int* d_result, int num1, int num2, int3* d_temp)
+ {
+ 	int idx01 = (blockIdx.y  * MULT_BLOCK_DIMY),  idx02 = (blockIdx.x  * MULT_BLOCK_DIMX);
+@@ -1450,19 +1475,11 @@ void __global__ MultiplyDescriptor_Kernel(cudaTextureObject_t texDes1, cudaTextu
+ 	for(int i = 0; i < 8; ++i)
+ 	{
+ 		uint4 v = tex1Dfetch<uint4>(texDes2, read_idx2 + i);
+-		unsigned char* p2 = (unsigned char*)(&v);
+ #pragma unroll
+ 		for(int k = 0; k < MULT_BLOCK_DIMY; ++k)
+ 		{
+-			unsigned char* p1 = (unsigned char*) (data1 + k * 34 + i *  4 + (i/4));
+-			results[k] += 	 ( IMUL(p1[0], p2[0])	+ IMUL(p1[1], p2[1])
+-							 + IMUL(p1[2], p2[2])  	+ IMUL(p1[3], p2[3])
+-							 + IMUL(p1[4], p2[4])  	+ IMUL(p1[5], p2[5])
+-							 + IMUL(p1[6], p2[6])  	+ IMUL(p1[7], p2[7])
+-							 + IMUL(p1[8], p2[8])  	+ IMUL(p1[9], p2[9])
+-							 + IMUL(p1[10], p2[10])	+ IMUL(p1[11], p2[11])
+-							 + IMUL(p1[12], p2[12])	+ IMUL(p1[13], p2[13])
+-							 + IMUL(p1[14], p2[14])	+ IMUL(p1[15], p2[15]));
++			const unsigned int* p1 = (const unsigned int*)(data1 + k * 34 + i *  4 + (i/4));
++			results[k] = (int)SiftDotChunk16(p1, v, (unsigned int)results[k]);
+ 		}
+ 	}
+ 
+@@ -1615,19 +1632,11 @@ void __global__ MultiplyDescriptorG_Kernel(cudaTextureObject_t texDes1, cudaText
+ 		for(int i = 0; i < 8; ++i)
+ 		{
+ 			uint4 v = tex1Dfetch<uint4>(texDes2, read_idx2 + i);
+-			unsigned char* p2 = (unsigned char*)(&v);
+ #pragma unroll
+ 			for(int k = 0; k < MULT_BLOCK_DIMY; ++k)
+ 			{
+-				unsigned char* p1 = (unsigned char*) (data1 + k * 34 + i *  4 + (i/4));
+-				results[k] += 	 ( IMUL(p1[0], p2[0])	+ IMUL(p1[1], p2[1])
+-								 + IMUL(p1[2], p2[2])  	+ IMUL(p1[3], p2[3])
+-								 + IMUL(p1[4], p2[4])  	+ IMUL(p1[5], p2[5])
+-								 + IMUL(p1[6], p2[6])  	+ IMUL(p1[7], p2[7])
+-								 + IMUL(p1[8], p2[8])  	+ IMUL(p1[9], p2[9])
+-								 + IMUL(p1[10], p2[10])	+ IMUL(p1[11], p2[11])
+-								 + IMUL(p1[12], p2[12])	+ IMUL(p1[13], p2[13])
+-								 + IMUL(p1[14], p2[14])	+ IMUL(p1[15], p2[15]));
++				const unsigned int* p1 = (const unsigned int*)(data1 + k * 34 + i *  4 + (i/4));
++				results[k] = (int)SiftDotChunk16(p1, v, (unsigned int)results[k]);
+ 			}
+ 		}
+ 	}
+-- 
+2.43.0
+

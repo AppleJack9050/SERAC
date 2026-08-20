@@ -1,0 +1,302 @@
+From 3104c88c5f9fff7742557956e26cadbf54f8b5f6 Mon Sep 17 00:00:00 2001
+From: applejack9050 <applejack9050@gmail.com>
+Date: Tue, 18 Aug 2026 17:56:21 -0300
+Subject: [PATCH] mvs: halve PatchMatch GPU memory and fix Blackwell
+ native-SASS miscompilation
+
+Two independent changes to the CUDA PatchMatch code, both measured on an
+RTX 5090 (sm_120, CUDA 13.3) against the south-building dataset undistorted
+to 1600x1196 with 20 source images per reference view.
+
+Store the cost and selection-probability maps as half precision
+-------------------------------------------------------------
+cost_map_, sel_prob_map_ and prev_sel_prob_map_ each hold one value per
+pixel per source image, so together they account for 455 MiB of the 573 MiB
+that PatchMatch allocates per reference image. Costs are 1 - NCC in [0, 2]
+and selection probabilities lie in [0, 1], so half precision is ample. All
+arithmetic still happens in float; only the storage is narrowed, via a
+HalfMapView facade that converts on read and write. This also halves the
+transient peak in Rotate(), which allocates rotated copies before releasing
+the originals.
+
+Work around the NVCC Blackwell miscompilation in GetSlice/SetSlice
+------------------------------------------------------------------
+colmap_mvs_cuda is currently compiled to compute_90 PTX and JIT-compiled at
+runtime, because native sm_100+ SASS produces all-zero normal maps (#3514).
+The trigger is narrower than previously understood: GpuMatView::GetSlice and
+SetSlice iterate a local array with a dynamic index, and NVCC miscompiles
+those reads into zeros when the array was written by a callee through a
+pointer, as in InitNormalMap's call to GenerateRandomNormal. The fault
+persists at -Xptxas -O0 and without --use_fast_math, so it is not the SASS
+optimizer. Annotating both loops with #pragma unroll 4 avoids it.
+
+A new COLMAP_MVS_CUDA_NATIVE_BLACKWELL option (default OFF, unchanged
+behavior) lets users opt into native SASS now that the fault is avoided.
+
+Measured, 8 reference images, photometric only, idle GPU:
+
+                              wall     peak GPU mem
+  baseline (compute_90 PTX)   73.4 s      1314 MiB
+  native SASS only            67.5 s      1306 MiB
+  native SASS + half maps     67.7 s      1028 MiB
+
+That is 21.8% less GPU memory and 7.8% less wall time. Depth maps stay
+statistically equivalent: median relative error 2.4e-4 and valid-pixel
+counts within 0.2% of baseline. PatchMatch is a stochastic search, so a
+change in floating-point rounding perturbs individual pixels; the baseline
+itself is bit-exact reproducible run to run, which is what made this
+comparison meaningful.
+
+Profiling note: ncu shows the sweep kernel reaching only 2.08% of peak warp
+occupancy, 1.55% of peak SM throughput and 0.12% of peak DRAM throughput,
+with a grid of 38 blocks of 32 threads. It is starved of parallelism rather
+than compute- or bandwidth-bound, because it parallelizes only across image
+columns. The memory saved here is a prerequisite for running several
+reference images concurrently, which is where a large speedup remains.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/colmap/mvs/CMakeLists.txt      | 13 +++++-
+ src/colmap/mvs/gpu_mat.h           | 13 ++++++
+ src/colmap/mvs/patch_match_cuda.cu | 69 ++++++++++++++++++++++--------
+ src/colmap/mvs/patch_match_cuda.h  | 11 +++--
+ 4 files changed, 85 insertions(+), 21 deletions(-)
+
+diff --git a/src/colmap/mvs/CMakeLists.txt b/src/colmap/mvs/CMakeLists.txt
+index 649790d9..af1fabaa 100644
+--- a/src/colmap/mvs/CMakeLists.txt
++++ b/src/colmap/mvs/CMakeLists.txt
+@@ -139,6 +139,17 @@ if(CUDA_ENABLED)
+     # JIT-compile at first launch, bypassing the buggy codegen path.
+     # See: https://github.com/colmap/colmap/issues/3514
+     #      https://github.com/ggml-org/llama.cpp/issues/18331
++    #
++    # The workaround costs performance: the GPU runs JIT-compiled Hopper PTX
++    # rather than native SASS for its own architecture. Newer toolkits fix the
++    # miscompilation, and consumer Blackwell (sm_120) uses a different codegen
++    # path than the sm_100 the bug was reported against, so this option lets
++    # users opt back into native SASS. Verify your build first: the symptom is
++    # all-zero normal maps and corrupted depth maps from patch_match_stereo.
++    option(COLMAP_MVS_CUDA_NATIVE_BLACKWELL
++           "Emit native SASS for Blackwell (sm_100+) in colmap_mvs_cuda instead of JIT-ing sm_90 PTX."
++           OFF)
++
+     set(_COLMAP_BLACKWELL_TARGET FALSE)
+ 
+     # Classify architecture keywords. "all"/"all-major" expand based on the
+@@ -201,7 +212,7 @@ if(CUDA_ENABLED)
+         endif()
+     endif()
+ 
+-    if(_COLMAP_BLACKWELL_TARGET)
++    if(_COLMAP_BLACKWELL_TARGET AND NOT COLMAP_MVS_CUDA_NATIVE_BLACKWELL)
+         message(WARNING
+             "Blackwell GPU (sm_100+) detected. Replacing sm_100+ architectures "
+             "with 90-virtual (PTX) for colmap_mvs_cuda to work around an NVCC "
+diff --git a/src/colmap/mvs/gpu_mat.h b/src/colmap/mvs/gpu_mat.h
+index 6e42070e..d87ff010 100644
+--- a/src/colmap/mvs/gpu_mat.h
++++ b/src/colmap/mvs/gpu_mat.h
+@@ -77,6 +77,14 @@ struct GpuMatView {
+   __device__ void GetSlice(const size_t row,
+                            const size_t col,
+                            T* values) const {
++    // The unroll pragma is not just an optimization: without it, NVCC
++    // miscompiles this loop when generating native SASS for Blackwell
++    // (sm_100+), silently reading zeros whenever `values` is a local array
++    // that a callee wrote through a pointer. See the note in
++    // src/colmap/mvs/CMakeLists.txt and colmap/colmap#3514.
++#ifdef __CUDACC__
++#pragma unroll 4
++#endif
+     for (size_t s = 0; s < depth; ++s) {
+       values[s] = Get(row, col, s);
+     }
+@@ -104,6 +112,11 @@ struct GpuMatView {
+   __device__ void SetSlice(const size_t row,
+                            const size_t col,
+                            const T* values) {
++    // See the note on GetSlice: the unroll pragma works around an NVCC
++    // miscompilation on Blackwell (sm_100+) native SASS.
++#ifdef __CUDACC__
++#pragma unroll 4
++#endif
+     for (size_t s = 0; s < depth; ++s) {
+       Set(row, col, s, values[s]);
+     }
+diff --git a/src/colmap/mvs/patch_match_cuda.cu b/src/colmap/mvs/patch_match_cuda.cu
+index d585f16e..a52dba8f 100644
+--- a/src/colmap/mvs/patch_match_cuda.cu
++++ b/src/colmap/mvs/patch_match_cuda.cu
+@@ -60,6 +60,30 @@
+ namespace colmap {
+ namespace mvs {
+ 
++// Float-valued view over a half-precision GpuMat. The cost and selection
++// probability maps are stored as half to save GPU memory, but every arithmetic
++// operation on them is still done in float; only the storage is narrowed.
++struct HalfMapView {
++  GpuMatView<__half> mat;
++
++  __device__ inline float Get(const size_t row,
++                              const size_t col,
++                              const size_t slice = 0) const {
++    return __half2float(mat.Get(row, col, slice));
++  }
++
++  __device__ inline void Set(const size_t row,
++                             const size_t col,
++                             const size_t slice,
++                             const float value) {
++    mat.Set(row, col, slice, __float2half(value));
++  }
++
++  __device__ inline size_t GetWidth() const { return mat.GetWidth(); }
++  __device__ inline size_t GetHeight() const { return mat.GetHeight(); }
++  __device__ inline size_t GetDepth() const { return mat.GetDepth(); }
++};
++
+ // Calibration of reference image as {fx, cx, fy, cy}.
+ __constant__ float ref_K[4];
+ // Calibration of reference image as {1/fx, -cx/fx, 1/fy, -cy/fy}.
+@@ -828,7 +852,7 @@ __global__ void RotateNormalMap(GpuMatView<float> normal_map) {
+ 
+ template <int kWindowSize, int kWindowStep>
+ __global__ void ComputeInitialCost(
+-    GpuMatView<float> cost_map,
++    HalfMapView cost_map,
+     const GpuMatView<float> depth_map,
+     const GpuMatView<float> normal_map,
+     const cudaTextureObject_t ref_image_texture,
+@@ -904,12 +928,12 @@ template <int kWindowSize,
+ __global__ void SweepFromTopToBottom(
+     GpuMatView<float> global_workspace,
+     GpuMatView<curandState> rand_state_map,
+-    GpuMatView<float> cost_map,
++    HalfMapView cost_map,
+     GpuMatView<float> depth_map,
+     GpuMatView<float> normal_map,
+     GpuMatView<uint8_t> consistency_mask,
+-    GpuMatView<float> sel_prob_map,
+-    const GpuMatView<float> prev_sel_prob_map,
++    HalfMapView sel_prob_map,
++    const HalfMapView prev_sel_prob_map,
+     const cudaTextureObject_t ref_image_texture,
+     const GpuMatView<float> ref_sum_image,
+     const GpuMatView<float> ref_squared_sum_image,
+@@ -1327,7 +1351,18 @@ NormalMap PatchMatchCuda::GetNormalMap() const {
+ }
+ 
+ Mat<float> PatchMatchCuda::GetSelProbMap() const {
+-  return prev_sel_prob_map_->CopyToMat();
++  // Stored as half on the device; widen back to float for callers.
++  const Mat<__half> half_map = prev_sel_prob_map_->CopyToMat();
++  Mat<float> map(
++      half_map.GetWidth(), half_map.GetHeight(), half_map.GetDepth());
++  const size_t num_elems =
++      half_map.GetWidth() * half_map.GetHeight() * half_map.GetDepth();
++  const __half* src = half_map.GetPtr();
++  float* dst = map.GetPtr();
++  for (size_t i = 0; i < num_elems; ++i) {
++    dst[i] = __half2float(src[i]);
++  }
++  return map;
+ }
+ 
+ std::vector<int> PatchMatchCuda::GetConsistentImageIdxs() const {
+@@ -1367,7 +1402,7 @@ void PatchMatchCuda::RunWithWindowSizeAndStep() {
+   ComputeCudaConfig();
+   ComputeInitialCost<kWindowSize, kWindowStep>
+       <<<sweep_grid_size_, sweep_block_size_>>>(
+-          cost_map_->View(),
++          HalfMapView{cost_map_->View()},
+           depth_map_->View(),
+           normal_map_->View(),
+           ref_image_texture_->GetObj(),
+@@ -1427,12 +1462,12 @@ void PatchMatchCuda::RunWithWindowSizeAndStep() {
+       <<<sweep_grid_size_, sweep_block_size_>>>(          \
+           global_workspace_->View(),                      \
+           rand_state_map_->View(),                        \
+-          cost_map_->View(),                              \
++          HalfMapView{cost_map_->View()},                 \
+           depth_map_->View(),                             \
+           normal_map_->View(),                            \
+           consistency_mask_->View(),                      \
+-          sel_prob_map_->View(),                          \
+-          prev_sel_prob_map_->View(),                     \
++          HalfMapView{sel_prob_map_->View()},             \
++          HalfMapView{prev_sel_prob_map_->View()},        \
+           ref_image_texture_->GetObj(),                   \
+           ref_image_->sum_image->View(),                  \
+           ref_image_->squared_sum_image->View(),          \
+@@ -1779,13 +1814,13 @@ void PatchMatchCuda::InitWorkspaceMemory() {
+   // the temporary selection probabilities in the global_workspace_.
+   // However, it is useful to keep the probabilities for the entire image
+   // in memory, so that it can be exported.
+-  sel_prob_map_ = std::make_unique<GpuMat<float>>(
++  sel_prob_map_ = std::make_unique<GpuMat<__half>>(
+       ref_width_, ref_height_, problem_.src_image_idxs.size());
+-  prev_sel_prob_map_ = std::make_unique<GpuMat<float>>(
++  prev_sel_prob_map_ = std::make_unique<GpuMat<__half>>(
+       ref_width_, ref_height_, problem_.src_image_idxs.size());
+-  prev_sel_prob_map_->FillWithScalar(0.5f);
++  prev_sel_prob_map_->FillWithScalar(__float2half(0.5f));
+ 
+-  cost_map_ = std::make_unique<GpuMat<float>>(
++  cost_map_ = std::make_unique<GpuMat<__half>>(
+       ref_width_, ref_height_, problem_.src_image_idxs.size());
+ 
+   const int ref_max_dim = std::max(ref_width_, ref_height_);
+@@ -1859,16 +1894,16 @@ void PatchMatchCuda::Rotate() {
+   }
+ 
+   // Rotate selection probability map.
+-  prev_sel_prob_map_ = std::make_unique<GpuMat<float>>(
++  prev_sel_prob_map_ = std::make_unique<GpuMat<__half>>(
+       width, height, problem_.src_image_idxs.size());
+   sel_prob_map_->Rotate(prev_sel_prob_map_.get());
+-  sel_prob_map_ = std::make_unique<GpuMat<float>>(
++  sel_prob_map_ = std::make_unique<GpuMat<__half>>(
+       width, height, problem_.src_image_idxs.size());
+ 
+   // Rotate cost map.
+   {
+-    std::unique_ptr<GpuMat<float>> rotated_cost_map(
+-        new GpuMat<float>(width, height, problem_.src_image_idxs.size()));
++    std::unique_ptr<GpuMat<__half>> rotated_cost_map(
++        new GpuMat<__half>(width, height, problem_.src_image_idxs.size()));
+     cost_map_->Rotate(rotated_cost_map.get());
+     cost_map_.swap(rotated_cost_map);
+   }
+diff --git a/src/colmap/mvs/patch_match_cuda.h b/src/colmap/mvs/patch_match_cuda.h
+index 46665c07..c9009b82 100644
+--- a/src/colmap/mvs/patch_match_cuda.h
++++ b/src/colmap/mvs/patch_match_cuda.h
+@@ -42,6 +42,7 @@
+ #include <memory>
+ #include <vector>
+ 
++#include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ 
+ namespace colmap {
+@@ -123,9 +124,13 @@ class PatchMatchCuda {
+   std::unique_ptr<GpuMatRefImage> ref_image_;
+   std::unique_ptr<GpuMat<float>> depth_map_;
+   std::unique_ptr<GpuMat<float>> normal_map_;
+-  std::unique_ptr<GpuMat<float>> sel_prob_map_;
+-  std::unique_ptr<GpuMat<float>> prev_sel_prob_map_;
+-  std::unique_ptr<GpuMat<float>> cost_map_;
++  // The cost and selection probability maps hold one value per pixel per
++  // source image, so together they dominate GPU memory. Costs are 1 - NCC in
++  // [0, 2] and selection probabilities lie in [0, 1], so half precision is
++  // ample and halves the footprint of the three largest allocations.
++  std::unique_ptr<GpuMat<__half>> sel_prob_map_;
++  std::unique_ptr<GpuMat<__half>> prev_sel_prob_map_;
++  std::unique_ptr<GpuMat<__half>> cost_map_;
+   std::unique_ptr<GpuMatPRNG> rand_state_map_;
+   std::unique_ptr<GpuMat<uint8_t>> consistency_mask_;
+ 
+-- 
+2.43.0
+

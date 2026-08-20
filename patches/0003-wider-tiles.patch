@@ -1,0 +1,66 @@
+From 25127dad7e38048490899e8fdb291f805218ade6 Mon Sep 17 00:00:00 2001
+From: applejack9050 <applejack9050@gmail.com>
+Date: Tue, 18 Aug 2026 22:54:54 -0300
+Subject: [PATCH 3/4] feature: match 16 descriptor rows per block instead of 8
+
+With the dot matrix gone the multiply kernel became limited by re-reading
+the second image's descriptors: ncu showed L1/TEX at 86% while DRAM had
+fallen to 17%. Each block re-fetches all 128 of its columns' descriptors
+for every row-block, so doubling the rows per block halves that traffic.
+It also halves the column-partial table that ColMatch_Kernel consumes.
+
+SiftGPU already carried a MULT_BLOCK_DIMY == 16 descriptor-load path for
+exactly this shape; only the constant had to change, in both the kernel
+and the matcher that sizes the partial tables from it.
+
+RTX 5090 (sm_120), 40 images of south-building, 780 pairs:
+  MultiplyDescriptor_Kernel  629us -> 468us  (-26%)
+  ColMatch_Kernel            330us -> 132us  (-60%)
+  matching GPU total         768ms -> 483ms
+  matcher peak GPU memory   952MiB -> 742MiB
+
+The kernel now runs at 96.7% compute and 98.1% L1/TEX throughput, so
+this is the end of what retiling buys; registers rise 72 -> 91 and
+occupancy drops to 40%, and it is still a clear net win.
+
+Cumulative against the unmodified matcher: GPU time 1166ms -> 483ms
+(-59%), peak GPU memory 1762MiB -> 742MiB (-58%).
+
+Match counts remain identical to the original, 201757 over 780 pairs,
+on both the plain and the guided path.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/thirdparty/SiftGPU/ProgramCU.cu    | 2 +-
+ src/thirdparty/SiftGPU/SiftMatchCU.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/thirdparty/SiftGPU/ProgramCU.cu b/src/thirdparty/SiftGPU/ProgramCU.cu
+index 6fdf6a6f..688974e3 100644
+--- a/src/thirdparty/SiftGPU/ProgramCU.cu
++++ b/src/thirdparty/SiftGPU/ProgramCU.cu
+@@ -1406,7 +1406,7 @@ int ProgramCU::CheckCudaDevice(int device)
+ #define MULT_TBLOCK_DIMX 128
+ #define MULT_TBLOCK_DIMY 1
+ #define MULT_BLOCK_DIMX (MULT_TBLOCK_DIMX)
+-#define MULT_BLOCK_DIMY (8 * MULT_TBLOCK_DIMY)
++#define MULT_BLOCK_DIMY (16 * MULT_TBLOCK_DIMY)
+ 
+ // Dot product of two 16-byte descriptor chunks, each held as four 32-bit words
+ // packing four unsigned bytes, accumulated into `sum`.
+diff --git a/src/thirdparty/SiftGPU/SiftMatchCU.cpp b/src/thirdparty/SiftGPU/SiftMatchCU.cpp
+index cbb948cd..9a18a614 100644
+--- a/src/thirdparty/SiftGPU/SiftMatchCU.cpp
++++ b/src/thirdparty/SiftGPU/SiftMatchCU.cpp
+@@ -42,7 +42,7 @@ using namespace std;
+ #define MULT_TBLOCK_DIMX 128
+ #define MULT_TBLOCK_DIMY 1
+ #define MULT_BLOCK_DIMX (MULT_TBLOCK_DIMX)
+-#define MULT_BLOCK_DIMY (8 * MULT_TBLOCK_DIMY)
++#define MULT_BLOCK_DIMY (16 * MULT_TBLOCK_DIMY)
+ 
+ SiftMatchCU::SiftMatchCU(int max_sift) : SiftMatchGPU() {
+   _num_sift[0] = _num_sift[1] = 0;
+-- 
+2.43.0
+
